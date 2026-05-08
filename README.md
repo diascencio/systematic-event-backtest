@@ -18,7 +18,7 @@ summary statistics.
 
 ### Holding Period Analysis
 
-![Backtest Overview](backtest_overview.png)
+![Holding Period Analysis](backtest_holding.png)
 
 ## Quick Start
 
