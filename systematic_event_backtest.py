@@ -1,20 +1,27 @@
 """
-Backtest a systematic-event mean-reversion.
+Systematic Event Backtester.
 
-The program identifies broad market stress episodes using rolling Average
-Pairwise Correlation (APC), a volatility-adjusted market-return filter, and a
-minimum data-coverage requirement. For each event, it simulates randomized
-portfolios drawn from stocks with evidence of systematic downside exposure,
-adds capital only on sufficiently large within-event declines, and exits when
-the correlation shock dissipates or the maximum holding period is reached.
+Author: Diego Ascencio
+Created: 2026-05-09
+Project: Systematic Event Backtester
 
-Primary outputs:
-    systematic_event_backtest_results.csv
-    systematic_event_backtest_summary.csv
+
+This script tests a narrow empirical question: when pairwise stock correlations
+rise during broad selloffs, do the affected stocks mean-revert enough to earn
+positive risk-budgeted returns after costs?
+
+The unit of evidence is the stitched market-stress episode, not each raw trigger
+or Monte Carlo draw. Candidate APC shocks are consolidated into non-overlapping
+episodes, while stock-level entry lots are managed and exited independently
+inside those episodes. That structure keeps APC as the event-definition signal
+without double-counting the same crisis regime.
 """
+
+from __future__ import annotations
 
 import argparse
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -23,810 +30,1353 @@ from scipy import stats
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# Data loading and normalization
 
-def load_prices(file_path: str, date_col: str = "date",
-                ticker_col: str = "ticker", price_col: str = "price") -> pd.DataFrame:
-    """Load long or wide price data and return a date-by-ticker price matrix."""
-    print(f"[load] Reading price data from {file_path}...")
+@dataclass(frozen=True)
+class ResearchConfig:
+    """Research bounds and reproducibility controls set before the test is run."""
+
+    min_history: int = 252
+    apc_window_min: int = 35
+    apc_window_max: int = 126
+    max_apc_names: int = 125
+    n_simulations: int = 500
+    investment_unit: float = 1.0
+    round_trip_cost: float = 0.002
+    seed: int = 7
+
+
+def load_prices(
+    file_path: str,
+    date_col: str = "date",
+    ticker_col: str = "ticker",
+    price_col: str = "price",
+) -> pd.DataFrame:
+    """Read long or wide price data and return a clean date-by-ticker panel."""
+    print(f"[data] Reading the equity price panel: {file_path}")
     df = pd.read_csv(file_path, parse_dates=[date_col], low_memory=False)
     df[date_col] = pd.to_datetime(df[date_col])
 
-    # Normalize long and wide inputs into the same date-by-ticker structure.
     if ticker_col in df.columns and price_col in df.columns:
-        print("[load] Long-format data detected; pivoting observations to a wide price matrix.")
-        df = (df.pivot_table(index=date_col, columns=ticker_col,
-                             values=price_col, aggfunc="last")
-                .sort_index())
+        print(
+            "[data] Long-format observations detected; constructing the "
+            "price panel."
+        )
+        prices = (
+            df.pivot_table(
+                index=date_col,
+                columns=ticker_col,
+                values=price_col,
+                aggfunc="last",
+            )
+            .sort_index()
+            .apply(pd.to_numeric, errors="coerce")
+        )
     else:
-        print("[load] Wide-format data detected.")
-        df = df.set_index(date_col).sort_index()
-        df = df.apply(pd.to_numeric, errors="coerce")
+        print("[data] Wide-format price panel detected.")
+        prices = df.set_index(date_col).sort_index().apply(pd.to_numeric, errors="coerce")
 
-    # Exclude dates and tickers with no usable observations.
-    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
-    print(f"[load] Cleaned sample: {df.shape[0]:,} dates by "
-          f"{df.shape[1]:,} tickers.")
-    return df
+    prices = prices.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    print(
+        f"[data] Estimation sample: {prices.shape[0]:,} dates x "
+        f"{prices.shape[1]:,} securities."
+    )
+    return prices
 
-
-# Return construction
 
 def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """Calculate daily log returns from the adjusted price matrix."""
-    # Log returns are additive over time and convenient for correlation estimates.
+    """Compute daily log returns while preserving the panel's original missingness."""
     returns = np.log(prices / prices.shift(1))
-    return returns.dropna(how="all")
+    return returns.replace([np.inf, -np.inf], np.nan).dropna(how="all")
 
 
-# Systematic event detection
-
-def compute_rolling_apc(returns: pd.DataFrame, window: int,
-                        sample_size: int) -> pd.Series:
-    """
-    Estimate rolling Average Pairwise Correlation using a fixed stock subsample.
-
-    Estimating the full pairwise correlation matrix is expensive for a large
-    equity universe. A reproducible random subsample provides a lower-cost APC
-    estimate while preserving the central object of interest: market-wide
-    co-movement.
-    """
-    n_stocks = returns.shape[1]
-    actual_sample = min(sample_size, n_stocks)
-
-    rng = np.random.default_rng(42)
-    sampled_cols = rng.choice(returns.columns, size=actual_sample, replace=False)
-    sub = returns[sampled_cols].copy()
-
-    print(f"[apc] Estimating rolling APC with a {window}-day window and "
-          f"{actual_sample:,} sampled stocks...")
-
-    apc_values = []
-    dates = []
-
-    # Use NumPy arrays inside the rolling loop to reduce pandas overhead.
-    arr = sub.to_numpy(dtype=np.float64)
-    col_dates = sub.index
-
-    for t in range(window - 1, len(arr)):
-        window_data = arr[t - window + 1 : t + 1]          # shape: (window, sample)
-        # Correlation is undefined for flat or nearly flat return series.
-        stds = window_data.std(axis=0)
-        valid = stds > 1e-10
-        wd = window_data[:, valid]
-        if wd.shape[1] < 4:                                 # need at least four stocks
-            apc_values.append(np.nan)
-        else:
-            # Average unique stock-pair correlations.
-            corr = np.corrcoef(wd.T)                        # shape: (k, k)
-            # Use the upper triangle so that each pair enters exactly once.
-            k = corr.shape[0]
-            idx = np.triu_indices(k, k=1)
-            apc_values.append(float(np.nanmean(corr[idx])))
-        dates.append(col_dates[t])
-
-    apc = pd.Series(apc_values, index=dates, name="APC")
-    print(f"[apc] APC estimation complete. Sample range: "
-          f"[{apc.min():.3f}, {apc.max():.3f}].")
-    return apc
+def _finite_past(arr: np.ndarray, i: int) -> np.ndarray:
+    past = arr[:i]
+    return past[np.isfinite(past)]
 
 
-# Event identification
+def expanding_percentile_rank(series: pd.Series, min_history: int) -> pd.Series:
+    """Rank each observation against the empirical distribution available before that date."""
+    arr = series.to_numpy(dtype=np.float64)
+    out = np.full(len(arr), np.nan)
+    for i, value in enumerate(arr):
+        past = _finite_past(arr, i)
+        if len(past) >= min_history and np.isfinite(value):
+            out[i] = float(np.mean(past <= value))
+    return pd.Series(out, index=series.index, name=f"{series.name}_pct")
 
-def identify_events(returns: pd.DataFrame, apc: pd.Series,
-                    apc_threshold_quantile: float,
-                    cooldown_days: int,
-                    min_stocks_available: int,
-                    min_history_days: int = 252,
-                    mkt_drop_vol_window: int = 60,
-                    mkt_drop_vol_mult: float = 1.0,
-                    max_hold_days_scan: int = 756) -> pd.DataFrame:
-    """
-    Identify non-overlapping systematic events.
 
-    A date qualifies when APC exceeds its expanding historical threshold, the
-    equal-weighted market return is below its rolling volatility floor, and the
-    cross section contains enough valid stock returns. Once a trigger is
-    accepted, subsequent candidates are ignored until the estimated event window
-    has closed.
-    """
-    # Expanding APC threshold: only information available before date t is used.
-    apc_expanding_thresh = (
-        apc.shift(1)
-           .expanding(min_periods=min_history_days)
-           .quantile(apc_threshold_quantile)
+def dynamic_expanding_quantile(
+    series: pd.Series,
+    quantile_series: pd.Series,
+    min_history: int,
+) -> pd.Series:
+    """Evaluate an expanding quantile using only information available before the date."""
+    arr = series.to_numpy(dtype=np.float64)
+    q_arr = quantile_series.reindex(series.index).to_numpy(dtype=np.float64)
+    out = np.full(len(arr), np.nan)
+    for i, q in enumerate(q_arr):
+        past = _finite_past(arr, i)
+        if len(past) >= min_history and np.isfinite(q):
+            out[i] = float(np.quantile(past, np.clip(q, 0.01, 0.99)))
+    return pd.Series(out, index=series.index, name=f"{series.name}_adaptive_q")
+
+
+def adaptive_int_from_percentile(
+    percentile: pd.Series,
+    low: int,
+    high: int,
+    inverse: bool = False,
+) -> pd.Series:
+    """Map a state percentile into an integer window within ex ante bounds."""
+    p = percentile.fillna(0.5).clip(0.0, 1.0)
+    values = high - p * (high - low) if inverse else low + p * (high - low)
+    return values.round().astype(int)
+
+
+def build_market_state(returns: pd.DataFrame, cfg: ResearchConfig) -> pd.DataFrame:
+    """Build the point-in-time market state used by the adaptive rules."""
+    market_return = returns.mean(axis=1, skipna=True)
+    coverage = returns.notna().sum(axis=1)
+    frac_down = (returns.lt(0).sum(axis=1) / coverage.replace(0, np.nan)).rename("frac_down")
+
+    fast_vol = market_return.shift(1).ewm(
+        span=cfg.apc_window_min,
+        min_periods=max(10, cfg.apc_window_min // 2),
+    ).std()
+    slow_vol = market_return.shift(1).ewm(
+        span=cfg.apc_window_max,
+        min_periods=max(30, cfg.apc_window_max // 2),
+    ).std()
+    vol_ratio = (fast_vol / slow_vol.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    vol_ratio.name = "vol_ratio"
+    vol_percentile = expanding_percentile_rank(vol_ratio, cfg.min_history).rename("vol_percentile")
+    apc_window = adaptive_int_from_percentile(
+        vol_percentile,
+        cfg.apc_window_min,
+        cfg.apc_window_max,
+        inverse=True,
+    ).rename("apc_window")
+
+    return pd.concat(
+        [
+            market_return.rename("market_return"),
+            coverage.rename("coverage"),
+            frac_down,
+            fast_vol.rename("fast_market_vol"),
+            slow_vol.rename("slow_market_vol"),
+            vol_ratio,
+            vol_percentile,
+            apc_window,
+        ],
+        axis=1,
     )
-    print(f"[events] Expanding APC threshold: {apc_threshold_quantile:.0%} quantile; "
-          f"first valid date = {apc_expanding_thresh.first_valid_index()}.")
-    print(f"[events] APC threshold range: "
-          f"[{apc_expanding_thresh.min():.4f}, {apc_expanding_thresh.max():.4f}].")
 
-    # Equal-weighted market return, used as a broad market proxy.
-    mkt_ret = returns.mean(axis=1)
 
-    # Volatility-adjusted market drop filter.
-    rolling_std        = (mkt_ret.shift(1)
-                                  .rolling(window=mkt_drop_vol_window, min_periods=20)
-                                  .std())
-    mkt_drop_threshold = -mkt_drop_vol_mult * rolling_std
-    print(f"[events] Market filter: equal-weighted return below "
-          f"{mkt_drop_vol_mult:.2f} rolling standard deviations "
-          f"({mkt_drop_vol_window}-day window).")
-    print(f"[events] Market-return threshold range: "
-          f"[{mkt_drop_threshold.min():.4f}, {mkt_drop_threshold.max():.4f}].")
+def compute_adaptive_apc(
+    returns: pd.DataFrame,
+    state: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> pd.DataFrame:
+    """
+    Estimate APC with an adaptive lookback and deterministic coverage sample.
 
-    # Align dates before applying event filters.
-    common = (apc.index
-                 .intersection(apc_expanding_thresh.dropna().index)
-                 .intersection(returns.index))
+    The cross-sectional sample is deterministic so that changes in results are
+    attributable to the signal and data, not to random APC subsampling.
+    """
+    arr = returns.to_numpy(dtype=np.float64)
+    dates = returns.index
+    tickers = np.array(returns.columns)
+    windows = state["apc_window"].reindex(dates).fillna(cfg.apc_window_max).astype(int).to_numpy()
 
-    apc_a       = apc.loc[common]
-    thresh_a    = apc_expanding_thresh.loc[common]
-    mkt_a       = mkt_ret.loc[common]
-    mkt_floor_a = mkt_drop_threshold.reindex(common).fillna(0.0)
-    ret_a       = returns.loc[common]
+    apc_values = np.full(len(dates), np.nan)
+    apc_names = np.zeros(len(dates), dtype=int)
 
-    # Candidate event filters.
-    apc_spike   = apc_a > thresh_a
-    mkt_down    = mkt_a < mkt_floor_a
-    enough_data = ret_a.notna().sum(axis=1) >= min_stocks_available
-
-    candidates = common[apc_spike & mkt_down & enough_data]
-
-    # Keep event windows from overlapping; accepted events block later candidates
-    # until the estimated event end date.
-    price_dates_list = list(prices_idx) if hasattr(prices_idx := returns.index, '__iter__') else list(returns.index)
-    price_dates_set  = set(price_dates_list)
-
-    events       = []
-    last_end     = pd.Timestamp("1900-01-01")   # end date of the last active event
-
-    for d in candidates:
-        # Skip candidates that fall within the previous event window.
-        if d <= last_end:
+    print("[apc] Estimating average pairwise correlation with adaptive lookbacks.")
+    for i in range(len(dates)):
+        window = int(windows[i])
+        if i + 1 < window:
             continue
 
-        # Estimate the event end date using the same APC rule as the simulator.
-        future = [fd for fd in price_dates_list if fd >= d][:max_hold_days_scan + 1]
-        end_date = future[-1] if future else d
+        window_data = arr[i - window + 1 : i + 1]
+        valid_idx = np.flatnonzero(np.isfinite(window_data).all(axis=0))
+        if len(valid_idx) < 4:
+            continue
 
-        for fd in future:
-            if fd > d:
-                apc_fd   = apc_a.get(fd, np.nan) if fd in apc_a.index else np.nan
-                thr_fd   = thresh_a.get(fd, np.nan) if fd in thresh_a.index else np.nan
-                if not (np.isnan(apc_fd) or np.isnan(thr_fd)) and apc_fd < thr_fd:
-                    end_date = fd
-                    break
+        if len(valid_idx) > cfg.max_apc_names:
+            order = np.argsort(tickers[valid_idx].astype(str))
+            spaced = np.linspace(0, len(order) - 1, cfg.max_apc_names).round().astype(int)
+            valid_idx = valid_idx[order[spaced]]
 
-        n_down  = (ret_a.loc[d] < 0).sum()
-        n_valid = ret_a.loc[d].notna().sum()
-        events.append({
-            "date"           : d,
-            "end_date_est"   : end_date,   # used only to prevent overlapping events
-            "market_return"  : float(mkt_a.loc[d]),
-            "mkt_threshold"  : float(mkt_floor_a.loc[d]),
-            "apc"            : float(apc_a.loc[d]),
-            "apc_threshold"  : float(thresh_a.loc[d]),
-            "n_stocks_down"  : int(n_down),
-            "n_stocks_valid" : int(n_valid),
-        })
-        last_end = end_date
+        wd = window_data[:, valid_idx]
+        keep = wd.std(axis=0) > 1e-12
+        wd = wd[:, keep]
+        if wd.shape[1] < 4:
+            continue
+
+        corr = np.corrcoef(wd.T)
+        upper = np.triu_indices(corr.shape[0], k=1)
+        apc_values[i] = float(np.nanmean(corr[upper]))
+        apc_names[i] = int(wd.shape[1])
+
+        if i and i % 1000 == 0:
+            print(f"[apc] Processed {i:,}/{len(dates):,} dates in the APC panel.")
+
+    apc = pd.Series(apc_values, index=dates, name="apc")
+    print(f"[apc] Completed APC estimation; observed range {apc.min():.3f} to {apc.max():.3f}.")
+    return pd.DataFrame({"apc": apc, "apc_n_names": apc_names}, index=dates)
+
+
+def build_adaptive_thresholds(
+    returns: pd.DataFrame,
+    state: pd.DataFrame,
+    apc_frame: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> pd.DataFrame:
+    """Estimate point-in-time event thresholds from prior empirical distributions."""
+    idx = returns.index
+    state = state.reindex(idx)
+    apc = apc_frame["apc"].reindex(idx)
+    vol_pct = state["vol_percentile"].fillna(0.5).clip(0.0, 1.0)
+
+    apc_q = (0.55 + 0.35 * vol_pct).rename("apc_threshold_quantile")
+    market_q = (0.20 - 0.15 * vol_pct).rename("market_tail_quantile")
+    breadth_q = (0.55 + 0.25 * vol_pct).rename("breadth_quantile")
+    coverage_q = (0.20 + 0.15 * (1.0 - vol_pct)).rename("coverage_quantile")
+
+    apc_threshold = dynamic_expanding_quantile(apc.rename("apc"), apc_q, cfg.min_history)
+    apc_threshold.name = "apc_threshold"
+    market_threshold = dynamic_expanding_quantile(
+        state["market_return"].rename("market_return"),
+        market_q,
+        cfg.min_history,
+    )
+    market_threshold.name = "market_return_threshold"
+    breadth_threshold = dynamic_expanding_quantile(
+        state["frac_down"].rename("frac_down"),
+        breadth_q,
+        cfg.min_history,
+    )
+    breadth_threshold.name = "frac_down_threshold"
+    coverage_floor = dynamic_expanding_quantile(
+        state["coverage"].rename("coverage"),
+        coverage_q,
+        cfg.min_history,
+    ).round()
+    coverage_floor.name = "coverage_floor"
+
+    apc_excess = (apc - apc_threshold).rename("apc_excess")
+    apc_excess_pct = expanding_percentile_rank(apc_excess.clip(lower=0), cfg.min_history)
+    market_stress_pct = expanding_percentile_rank(
+        (-state["market_return"]).clip(lower=0).rename("market_drop_abs"),
+        cfg.min_history,
+    )
+    breadth_pct = expanding_percentile_rank(state["frac_down"].rename("frac_down"), cfg.min_history)
+    severity = pd.concat([apc_excess_pct, market_stress_pct, breadth_pct], axis=1).mean(axis=1)
+    severity = severity.where(state["market_return"] < 0).rename("event_severity")
+
+    return pd.concat(
+        [
+            apc_q,
+            market_q,
+            breadth_q,
+            coverage_q,
+            apc_threshold,
+            market_threshold,
+            breadth_threshold,
+            coverage_floor,
+            apc_excess,
+            apc_excess_pct.rename("apc_excess_percentile"),
+            market_stress_pct.rename("market_stress_percentile"),
+            breadth_pct.rename("breadth_percentile"),
+            severity,
+        ],
+        axis=1,
+    )
+
+
+def adaptive_episode_bridge_days(
+    date: pd.Timestamp,
+    state: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> int:
+    """
+    Adaptive bridge used to stitch adjacent triggers into one stress episode.
+
+    In volatile regimes, systematic shocks often arrive in waves. The bridge
+    therefore treats nearby APC triggers as one unresolved regime instead of
+    repeatedly re-opening the same event.
+    """
+    vol_pct = state.at[date, "vol_percentile"] if date in state.index else np.nan
+    apc_window = state.at[date, "apc_window"] if date in state.index else cfg.apc_window_max
+    vol_pct = 0.5 if not np.isfinite(vol_pct) else float(np.clip(vol_pct, 0.0, 1.0))
+    apc_window = cfg.apc_window_max if not np.isfinite(apc_window) else int(apc_window)
+    bridge = int(round(apc_window * (0.15 + 0.45 * vol_pct)))
+    return int(np.clip(bridge, max(2, cfg.apc_window_min // 8), cfg.apc_window_max // 2))
+
+
+def adaptive_stability_days(
+    date: pd.Timestamp,
+    state: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> int:
+    """Return the number of normalized trading days required to close an episode."""
+    vol_pct = state.at[date, "vol_percentile"] if date in state.index else np.nan
+    vol_pct = 0.5 if not np.isfinite(vol_pct) else float(np.clip(vol_pct, 0.0, 1.0))
+    window = state.at[date, "apc_window"] if date in state.index else cfg.apc_window_max
+    window = cfg.apc_window_max if not np.isfinite(window) else int(window)
+    stable_days = int(round(window * (0.02 + 0.04 * (1.0 - vol_pct))))
+    return int(np.clip(stable_days, 1, max(1, cfg.apc_window_min // 5)))
+
+
+def find_episode_end_index(
+    start_i: int,
+    idx: pd.DatetimeIndex,
+    state: pd.DataFrame,
+    apc_frame: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> tuple[int, str, int]:
+    """
+    Find the natural end of a systematic episode.
+
+    Episodes close after APC and market stress have jointly normalized for a
+    state-dependent number of trading days. This separates the research episode
+    from the holding period of any individual stock-level lot.
+    """
+    start_date = idx[start_i]
+    stable_needed = adaptive_stability_days(start_date, state, cfg)
+    stable_count = 0
+
+    for j in range(start_i + 1, len(idx)):
+        date = idx[j]
+        apc_today = apc_frame.at[date, "apc"]
+        apc_threshold = thresholds.at[date, "apc_threshold"]
+        market_return = state.at[date, "market_return"]
+        market_threshold = thresholds.at[date, "market_return_threshold"]
+
+        normalized = (
+            np.isfinite(apc_today)
+            and np.isfinite(apc_threshold)
+            and apc_today <= apc_threshold
+            and (
+                not np.isfinite(market_return)
+                or not np.isfinite(market_threshold)
+                or market_return >= market_threshold
+            )
+        )
+
+        stable_count = stable_count + 1 if normalized else 0
+        if stable_count >= stable_needed:
+            return j, "apc_and_market_normalized", stable_needed
+
+    return len(idx) - 1, "sample_end", stable_needed
+
+
+def identify_events(
+    returns: pd.DataFrame,
+    state: pd.DataFrame,
+    apc_frame: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> pd.DataFrame:
+    """
+    Identify non-overlapping systematic episodes.
+
+    Candidate trigger dates are stitched into one event when they occur before
+    the prior episode has normalized, or inside the adaptive bridge window after
+    normalization. The resulting observations are closer to independent market
+    regimes than to raw trigger dates.
+    """
+    idx = returns.index
+    state = state.reindex(idx)
+    apc_frame = apc_frame.reindex(idx)
+    thresholds = thresholds.reindex(idx)
+
+    apc_spike = apc_frame["apc"] > thresholds["apc_threshold"]
+    market_down = state["market_return"] < thresholds["market_return_threshold"]
+    broad_down = state["frac_down"] > thresholds["frac_down_threshold"]
+    enough_data = state["coverage"] >= thresholds["coverage_floor"]
+    candidate_mask = apc_spike & market_down & broad_down & enough_data
+    candidate_dates = list(idx[candidate_mask.fillna(False)])
+    candidate_pos = {date: idx.get_loc(date) for date in candidate_dates}
+
+    print(f"[events] Candidate APC trigger dates before stitching: {len(candidate_dates):,}.")
+
+    events: list[dict] = []
+    i = 0
+    while i < len(candidate_dates):
+        start = candidate_dates[i]
+        start_i = candidate_pos[start]
+        end_i, exit_reason, stable_days = find_episode_end_index(
+            start_i,
+            idx,
+            state,
+            apc_frame,
+            thresholds,
+            cfg,
+        )
+        bridge_days = adaptive_episode_bridge_days(start, state, cfg)
+        stitched_dates = [start]
+        i += 1
+
+        # Merge later triggers when they are still part of the same unresolved
+        # APC regime, even if they occur after the first normalization date.
+        while i < len(candidate_dates):
+            next_start = candidate_dates[i]
+            next_i = candidate_pos[next_start]
+            bridge_end_i = min(len(idx) - 1, end_i + bridge_days)
+            if next_i > bridge_end_i:
+                break
+
+            next_end_i, next_reason, next_stable_days = find_episode_end_index(
+                next_i,
+                idx,
+                state,
+                apc_frame,
+                thresholds,
+                cfg,
+            )
+            stitched_dates.append(next_start)
+            if next_end_i >= end_i:
+                end_i = next_end_i
+                exit_reason = next_reason
+                stable_days = max(stable_days, next_stable_days)
+            bridge_days = max(bridge_days, adaptive_episode_bridge_days(next_start, state, cfg))
+            i += 1
+
+        end = idx[end_i]
+        duration = int(end_i - start_i)
+        trigger_rows = thresholds.loc[stitched_dates]
+        peak_apc_date = apc_frame.loc[stitched_dates, "apc"].idxmax()
+        worst_market_date = state.loc[stitched_dates, "market_return"].idxmin()
+
+        events.append(
+            {
+                "event_date": start,
+                "end_date": end,
+                "duration_days": duration,
+                "exit_reason": exit_reason,
+                "stitched_trigger_count": len(stitched_dates),
+                "first_trigger_date": stitched_dates[0],
+                "last_trigger_date": stitched_dates[-1],
+                "episode_bridge_days": bridge_days,
+                "stability_days_required": stable_days,
+                "market_return": float(state.at[start, "market_return"]),
+                "worst_trigger_date": worst_market_date,
+                "worst_trigger_market_return": float(state.at[worst_market_date, "market_return"]),
+                "apc": float(apc_frame.at[start, "apc"]),
+                "peak_apc_date": peak_apc_date,
+                "peak_trigger_apc": float(apc_frame.at[peak_apc_date, "apc"]),
+                "apc_threshold": float(thresholds.at[start, "apc_threshold"]),
+                "apc_window": int(state.at[start, "apc_window"]),
+                "apc_n_names": int(apc_frame.at[start, "apc_n_names"]),
+                "frac_down": float(state.at[start, "frac_down"]),
+                "frac_down_threshold": float(thresholds.at[start, "frac_down_threshold"]),
+                "coverage": int(state.at[start, "coverage"]),
+                "coverage_floor": float(thresholds.at[start, "coverage_floor"]),
+                "vol_percentile": float(state.at[start, "vol_percentile"]),
+                "event_severity": float(trigger_rows["event_severity"].max()),
+            }
+        )
 
     event_df = pd.DataFrame(events)
-    print(f"[events] Identified {len(event_df):,} non-overlapping systematic events.")
-    if len(event_df):
-        worst = event_df.loc[event_df.market_return.idxmin()]
-        print(f"[events] Largest market decline: {worst.date.date()} | "
-              f"market return={worst.market_return:.2%}, "
-              f"market floor={worst.mkt_threshold:.2%}, "
-              f"APC={worst.apc:.3f}, threshold={worst.apc_threshold:.3f}.")
-    return event_df, apc_expanding_thresh
+    print(f"[events] Independent stitched episodes retained: {len(event_df):,}.")
+    if not event_df.empty:
+        print(
+            "[events] Episode duration range: "
+            f"{event_df.duration_days.min()} to {event_df.duration_days.max()} trading days; "
+            f"median={event_df.duration_days.median():.0f}."
+        )
+        print(
+            "[events] Trigger stitching diagnostics: "
+            f"mean={event_df.stitched_trigger_count.mean():.1f}; "
+            f"max={event_df.stitched_trigger_count.max()}."
+        )
+    return event_df
 
 
-# Z-score threshold calibration
+def estimate_adaptive_stock_volatility(
+    returns: pd.DataFrame,
+    state: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> pd.DataFrame:
+    """Blend fast and slow stock-volatility estimates by market regime."""
+    shifted = returns.shift(1)
+    fast = shifted.rolling(
+        cfg.apc_window_min,
+        min_periods=max(10, cfg.apc_window_min // 2),
+    ).std()
+    slow = shifted.rolling(
+        cfg.apc_window_max,
+        min_periods=max(30, cfg.apc_window_max // 2),
+    ).std()
+    w = state["vol_percentile"].reindex(returns.index).fillna(0.5).clip(0.0, 1.0)
+    return fast.mul(w, axis=0).add(slow.mul(1.0 - w, axis=0)).replace([np.inf, -np.inf], np.nan)
 
-def calibrate_z_threshold(prices: pd.DataFrame, returns: pd.DataFrame,
-                           events: pd.DataFrame, apc: pd.Series,
-                           apc_expanding_thresh: pd.Series,
-                           roll_std_arr: np.ndarray,
-                           round_trip_cost: float = 0.002,
-                           z_candidates: np.ndarray = None) -> float:
+
+def estimate_adaptive_betas(
+    returns: pd.DataFrame,
+    state: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> pd.DataFrame:
+    """Estimate point-in-time market betas with regime-dependent smoothing."""
+    market_return = state["market_return"].reindex(returns.index)
+    stock_shifted = returns.shift(1)
+    market_shifted = market_return.shift(1)
+
+    def beta_for_window(window: int, min_periods: int) -> pd.DataFrame:
+        cov = stock_shifted.rolling(window, min_periods=min_periods).cov(market_shifted)
+        var = market_shifted.rolling(window, min_periods=min_periods).var()
+        return cov.div(var.replace(0, np.nan), axis=0)
+
+    fast = beta_for_window(cfg.apc_window_min, max(10, cfg.apc_window_min // 2))
+    slow = beta_for_window(cfg.apc_window_max, max(30, cfg.apc_window_max // 2))
+    w = state["vol_percentile"].reindex(returns.index).fillna(0.5).clip(0.0, 1.0)
+    return fast.mul(w, axis=0).add(slow.mul(1.0 - w, axis=0)).replace([np.inf, -np.inf], np.nan)
+
+
+def build_drop_z_threshold(
+    returns: pd.DataFrame,
+    stock_vol: pd.DataFrame,
+    state: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> pd.Series:
+    """Estimate the entry cutoff from prior cross-sectional downside shocks."""
+    z = returns.abs().div(stock_vol.replace(0, np.nan)).where(returns < 0)
+    daily_tail = z.quantile(0.75, axis=1, interpolation="linear").rename("daily_negative_z_tail")
+    vol_pct = state["vol_percentile"].reindex(returns.index).fillna(0.5).clip(0.0, 1.0)
+    z_q = (0.60 + 0.30 * vol_pct).rename("z_threshold_quantile")
+    z_threshold = dynamic_expanding_quantile(daily_tail, z_q, cfg.min_history)
+    z_threshold.name = "drop_z_threshold"
+    return z_threshold
+
+
+def build_adaptive_lot_return_cap(
+    returns: pd.DataFrame,
+    state: pd.DataFrame,
+    cfg: ResearchConfig,
+) -> pd.Series:
     """
-    Select the z-score cutoff with the highest average forward net return.
+    Point-in-time cap for a single lot's positive payoff.
 
-    Candidate thresholds are evaluated using all eligible stock-days within the
-    detected event windows. Transaction costs are subtracted before scoring.
-    Since this is an in-sample calibration, the result should be interpreted as
-    exploratory research rather than a finalized trading rule.
+    The source data are not filtered. Instead, the estimator limits how much a
+    single security can contribute when its forward payoff lies far beyond the
+    prior cross-sectional positive-return tail.
     """
-    if z_candidates is None:
-        z_candidates = np.arange(0.25, 3.25, 0.25)
+    vol_pct = state["vol_percentile"].reindex(returns.index).fillna(0.5).clip(0.0, 1.0)
+    positive = returns.where(returns > 0)
+    q85 = positive.quantile(0.85, axis=1, interpolation="linear")
+    q95 = positive.quantile(0.95, axis=1, interpolation="linear")
+    q99 = positive.quantile(0.99, axis=1, interpolation="linear")
+    daily_tail = q85.mul(1.0 - vol_pct).add(q99.mul(vol_pct)).clip(lower=q95)
+    daily_tail.name = "daily_positive_log_return_tail"
 
-    prices_arr  = prices.to_numpy(dtype=np.float64)
-    returns_arr = returns.reindex(prices.index).to_numpy(dtype=np.float64)
-    date_idx    = {d: i for i, d in enumerate(prices.index)}
-    tickers     = prices.columns.tolist()
-    ticker_idx  = {t: i for i, t in enumerate(tickers)}
-
-    # Build event windows once for the calibration pass.
-    windows = build_event_windows(prices, apc, apc_expanding_thresh,
-                                  events, max_hold_days=252)
-
-    # Use every eligible stock-day rather than adding Monte Carlo sampling noise.
-    print("[calibrate] Collecting stock-day observations across detected event windows...")
-    z_obs  = []   # drop z-score on the investment date
-    fr_obs = []   # forward return through the event exit date
-
-    for w in windows:
-        t_start     = w["date"]
-        event_dates = w["event_dates"]
-
-        if t_start not in date_idx:
-            continue
-
-        event_row_idx = [date_idx[d] for d in event_dates if d in date_idx]
-        if len(event_row_idx) < 2:
-            continue
-        exit_row = event_row_idx[-1]
-
-        # Evaluate every stock on each interior event day.
-        for row in event_row_idx[1:-1]:
-            for col in range(len(tickers)):
-                ret_today   = returns_arr[row, col]
-                price_today = prices_arr[row, col]
-                std_today   = roll_std_arr[row, col]
-                exit_price  = prices_arr[exit_row, col]
-
-                if (np.isnan(ret_today)   or ret_today >= 0
-                        or np.isnan(price_today) or price_today <= 0
-                        or np.isnan(std_today)   or std_today <= 0
-                        or np.isnan(exit_price)  or exit_price <= 0):
-                    continue
-
-                z   = abs(ret_today) / std_today
-                fwd = (exit_price / price_today) - 1.0
-                z_obs.append(z)
-                fr_obs.append(fwd)
-
-    z_obs  = np.array(z_obs,  dtype=np.float64)
-    fr_obs = np.array(fr_obs, dtype=np.float64)
-    print(f"[calibrate] Eligible stock-day observations: {len(z_obs):,}.")
-
-    if len(z_obs) == 0:
-        print("[calibrate] No eligible observations found; using z_min = 1.00.")
-        return 1.0
-
-    # Score each candidate threshold.
-    print("[calibrate] Evaluating candidate z-score thresholds...")
-    best_z      = z_candidates[0]
-    best_metric = -np.inf
-    results_cal = []
-
-    for z_c in z_candidates:
-        mask = z_obs >= z_c
-        n    = mask.sum()
-        if n < 30:          # require at least 30 observations for a stable estimate
-            results_cal.append((z_c, np.nan, n))
-            continue
-
-        net_returns = fr_obs[mask] - round_trip_cost
-        metric      = net_returns.mean()
-        results_cal.append((z_c, metric, n))
-
-        if metric > best_metric:
-            best_metric = metric
-            best_z      = z_c
-
-    # Print the calibration table.
-    print(f"\n{'-'*52}")
-    print(f"  {'z_min':>6}  {'net_return':>12}  {'n_obs':>10}")
-    print(f"{'-'*52}")
-    for z_c, metric, n in results_cal:
-        marker = "  selected" if abs(z_c - best_z) < 1e-9 else ""
-        metric_str = f"{metric:>12.4f}" if not np.isnan(metric) else f"{'(insufficient)':>12}"
-        print(f"  {z_c:>6.2f}  {metric_str}  {n:>10,}{marker}")
-    print(f"{'-'*52}")
-    print(f"  Selected z_min = {best_z:.2f}  "
-          f"(net return {best_metric:.4f} per dollar)\n")
-
-    return float(best_z)
+    cap_q = (0.70 + 0.25 * vol_pct).rename("lot_return_cap_quantile")
+    cap = dynamic_expanding_quantile(daily_tail, cap_q, cfg.min_history)
+    cap.name = "adaptive_daily_lot_log_return_cap"
+    return cap.clip(lower=0)
 
 
-
-
-def build_event_windows(prices: pd.DataFrame, apc: pd.Series,
-                        apc_expanding_thresh: pd.Series,
-                        events: pd.DataFrame,
-                        max_hold_days: int) -> list:
-    """
-    Construct the trading-date window associated with each event.
-
-    The window starts on the trigger date and ends when APC falls below its
-    expanding threshold, unless the maximum holding period binds first. The exit
-    date is included because positions are liquidated on that date.
-    """
-    price_dates_set = set(prices.index)
-    windows = []
-
-    for _, ev in events.iterrows():
-        t_start = ev["date"]
-
-        # Candidate price dates from the trigger through the holding-period cap.
-        future_dates = prices.index[prices.index >= t_start][:max_hold_days + 1]
-
-        # End the event after APC falls back below its threshold.
-        event_dates = []
-        end_date    = future_dates[-1]   # default: hard stop
-
-        for d in future_dates:
-            event_dates.append(d)
-            # The trigger day is always included; exit checks begin afterward.
-            if d > t_start:
-                apc_today   = apc.get(d, np.nan)
-                thresh_today = apc_expanding_thresh.get(d, np.nan)
-                if np.isnan(apc_today) or np.isnan(thresh_today):
-                    continue
-                if apc_today < thresh_today:
-                    end_date = d
-                    break
-
-        windows.append({
-            "date"          : t_start,
-            "end_date"      : end_date,
-            "event_dates"   : event_dates,   # includes both trigger and exit dates
-            "duration_days" : len(event_dates) - 1,
-            "market_return" : ev["market_return"],
-            "apc"           : ev["apc"],
-            "apc_threshold" : ev["apc_threshold"],
-        })
-
+def build_event_windows(events: pd.DataFrame, price_index: pd.DatetimeIndex) -> list[dict]:
+    """Convert event metadata into contiguous windows on the price index."""
+    windows: list[dict] = []
+    for _, event in events.iterrows():
+        start = pd.Timestamp(event["event_date"])
+        end = pd.Timestamp(event["end_date"])
+        dates = price_index[(price_index >= start) & (price_index <= end)]
+        if len(dates) >= 2:
+            windows.append({"event": event, "dates": dates})
     return windows
 
 
-def simulate_strategy(prices: pd.DataFrame, returns: pd.DataFrame,
-                      events: pd.DataFrame, apc: pd.Series,
-                      apc_expanding_thresh: pd.Series,
-                      portfolio_size: int, max_hold_days: int,
-                      n_simulations: int,
-                      investment_per_stock: float = 1.0,
-                      z_min: float = 0.0,
-                      roll_std_arr: np.ndarray = None) -> pd.DataFrame:
+def adaptive_portfolio_size(eligible_count: int, frac_down: float) -> int:
+    """Choose portfolio breadth as a function of eligible names and selloff breadth."""
+    if eligible_count <= 0:
+        return 0
+    breadth = 0.5 if not np.isfinite(frac_down) else float(np.clip(frac_down, 0.0, 1.0))
+    target = int(round(np.sqrt(eligible_count) * (1.0 + breadth)))
+    return int(np.clip(target, 1, eligible_count))
+
+
+def build_adaptive_trade_horizon(
+    events: pd.DataFrame,
+    state: pd.DataFrame,
+    price_index: pd.DatetimeIndex,
+    cfg: ResearchConfig,
+) -> pd.Series:
     """
-    Run event-level Monte Carlo portfolio simulations.
+    Build a point-in-time lot-level trade horizon.
 
-    Each simulation samples eligible stocks on the trigger date, invests only on
-    later qualifying negative-return days, scales capital by event severity, and
-    liquidates the portfolio at the event exit. The low rule prevents the
-    strategy from averaging up within an event window.
+    Stitched episodes define the independent research observation. They should
+    not mechanically define how long each entry lot is held. The lot horizon
+    is learned from prior completed episode durations and blended with the
+    current APC window and volatility regime.
     """
-    # Estimate rolling beta for each stock against the equal-weighted market.
-    print("[sim] Estimating rolling 252-day OLS betas for each stock...")
-    mkt_ret = returns.mean(axis=1)
-    mkt_aligned = mkt_ret.reindex(prices.index)
+    events_sorted = events.sort_values("end_date").reset_index(drop=True)
+    prior_durations: list[float] = []
+    event_pointer = 0
+    horizons: list[int] = []
 
-    win = 252
-    ret_shifted = returns.shift(1).reindex(prices.index)
-    mkt_shifted = mkt_aligned.shift(1)
+    for date in price_index:
+        while event_pointer < len(events_sorted):
+            end_date = pd.Timestamp(events_sorted.at[event_pointer, "end_date"])
+            if end_date >= date:
+                break
+            prior_durations.append(float(events_sorted.at[event_pointer, "duration_days"]))
+            event_pointer += 1
 
-    roll_cov = ret_shifted.rolling(win, min_periods=60).cov(mkt_shifted)
-    roll_var = mkt_shifted.rolling(win, min_periods=60).var()
-    beta_df  = roll_cov.div(roll_var, axis=0)
-    beta_arr = beta_df.to_numpy(dtype=np.float64)
-    print("[sim] Rolling beta estimates complete.")
+        vol_pct = state.at[date, "vol_percentile"] if date in state.index else np.nan
+        vol_pct = 0.5 if not np.isfinite(vol_pct) else float(np.clip(vol_pct, 0.0, 1.0))
 
-    # Rolling volatility is reused when the caller has already calculated it.
-    if roll_std_arr is None:
-        print("[sim] Estimating rolling 60-day stock-level return volatility...")
-        roll_std_df  = (returns.shift(1)
-                               .reindex(prices.index)
-                               .rolling(60, min_periods=20)
-                               .std())
-        roll_std_arr = roll_std_df.to_numpy(dtype=np.float64)
-        print("[sim] Rolling volatility estimates complete.")
-    else:
-        print("[sim] Using the precomputed rolling volatility array.")
+        apc_window = state.at[date, "apc_window"] if date in state.index else cfg.apc_window_max
+        apc_window = cfg.apc_window_max if not np.isfinite(apc_window) else int(apc_window)
 
-    print(f"[sim] Investment filter: z_min = {z_min:.2f}; "
-          f"capital is deployed only when |r_i,t|/sigma_i,t >= {z_min:.2f}.")
+        if len(prior_durations) >= 5:
+            empirical_q = 0.45 + 0.35 * vol_pct
+            empirical_horizon = float(np.quantile(prior_durations, empirical_q))
+        elif prior_durations:
+            empirical_horizon = float(np.median(prior_durations))
+        else:
+            empirical_horizon = apc_window * (0.30 + 0.45 * vol_pct)
 
-    # Composite Severity Score by date.
-    print("[sim] Computing the Composite Severity Score (CSS)...")
-    apc_aligned    = apc.reindex(prices.index)
-    thresh_aligned = apc_expanding_thresh.reindex(prices.index)
-    mkt_arr_full   = mkt_aligned.to_numpy(dtype=np.float64)
+        regime_horizon = apc_window * (0.20 + 0.55 * vol_pct)
+        raw_horizon = 0.50 * empirical_horizon + 0.50 * regime_horizon
 
-    # S1: APC excess, scaled by its recent volatility.
-    apc_excess     = apc_aligned - thresh_aligned
-    apc_excess_std = apc_excess.shift(1).rolling(60, min_periods=20).std()
-    S1 = (apc_excess / apc_excess_std.replace(0, np.nan)).clip(lower=0)
+        # These bounds scale with the current APC window; they are governance
+        # constraints on an adaptive horizon rather than fitted constants.
+        horizon_floor = max(1, int(round(apc_window * (0.05 + 0.03 * vol_pct))))
+        horizon_cap = max(horizon_floor, int(round(apc_window * (0.65 + 0.55 * vol_pct))))
+        horizon = int(np.clip(round(raw_horizon), horizon_floor, horizon_cap))
+        horizons.append(max(1, horizon))
 
-    # S2: market drop size relative to recent volatility.
-    mkt_std = (mkt_aligned.shift(1).rolling(60, min_periods=20).std())
-    S2 = (mkt_aligned.abs() / mkt_std.replace(0, np.nan)).clip(lower=0)
+    return pd.Series(horizons, index=price_index, name="adaptive_trade_horizon_days")
 
-    # S3: fraction of stocks down, scaled so broad selloffs score higher.
-    frac_down = (returns.reindex(prices.index) < 0).mean(axis=1)
-    S3 = ((frac_down - 0.5) / 0.5).clip(lower=0)
 
-    # Average the three signals and cap extreme values.
-    CSS = ((S1 + S2 + S3) / 3).clip(lower=0, upper=3)
-    css_arr = CSS.to_numpy(dtype=np.float64)
+def is_locally_normalized(
+    row: int,
+    price_index: pd.DatetimeIndex,
+    state: pd.DataFrame,
+    thresholds: pd.DataFrame,
+) -> bool:
+    """Check whether APC and market stress have normalized on a given date."""
+    date = price_index[row]
+    if date not in state.index or date not in thresholds.index:
+        return False
 
-    # Report a concise diagnostic for the severity measure.
-    css_valid = CSS.dropna()
-    print(f"[sim] CSS range: [{css_valid.min():.3f}, {css_valid.max():.3f}]; "
-          f"mean={css_valid.mean():.3f}; median={css_valid.median():.3f}.")
+    apc_today = thresholds.at[date, "apc_excess"]
+    market_return = state.at[date, "market_return"]
+    market_threshold = thresholds.at[date, "market_return_threshold"]
 
-    # Event windows used by the simulations.
-    print("[sim] Constructing event windows from the APC exit rule...")
-    windows   = build_event_windows(prices, apc, apc_expanding_thresh,
-                                    events, max_hold_days)
-    durations = [w["duration_days"] for w in windows]
-    print(f"[sim] Event-window duration: min={min(durations)} days; "
-          f"median={int(np.median(durations))} days; max={max(durations)} days.")
+    apc_ok = np.isfinite(apc_today) and apc_today <= 0
+    market_ok = (
+        not np.isfinite(market_return)
+        or not np.isfinite(market_threshold)
+        or market_return >= market_threshold
+    )
+    return bool(apc_ok and market_ok)
 
-    prices_arr  = prices.to_numpy(dtype=np.float64)
-    returns_arr = returns.reindex(prices.index).to_numpy(dtype=np.float64)
-    tickers     = prices.columns.tolist()
-    ticker_idx  = {t: i for i, t in enumerate(tickers)}
-    date_idx    = {d: i for i, d in enumerate(prices.index)}
 
-    rng     = np.random.default_rng(0)
-    results = []
+def find_lot_exit_row(
+    entry_row: int,
+    episode_exit_row: int,
+    price_index: pd.DatetimeIndex,
+    state: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    trade_horizon_arr: np.ndarray,
+    cfg: ResearchConfig,
+) -> tuple[int, str]:
+    """
+    Find the adaptive exit row for a single entry lot.
 
-    for w in windows:
-        t_start     = w["date"]
-        event_dates = w["event_dates"]
-        duration    = w["duration_days"]
+    The lot exits on the earliest of local normalization, adaptive trade
+    horizon, or the end of the stitched episode. This keeps episode identity
+    separate from the realized holding period of each security.
+    """
+    if episode_exit_row <= entry_row:
+        return episode_exit_row, "episode_end"
 
-        if t_start not in date_idx:
+    horizon = trade_horizon_arr[entry_row] if entry_row < len(trade_horizon_arr) else np.nan
+    if not np.isfinite(horizon) or horizon <= 0:
+        date = price_index[entry_row]
+        apc_window = state.at[date, "apc_window"] if date in state.index else cfg.apc_window_max
+        horizon = apc_window if np.isfinite(apc_window) else cfg.apc_window_max
+
+    horizon_end_row = min(episode_exit_row, entry_row + max(1, int(round(horizon))))
+    stable_needed = adaptive_stability_days(price_index[entry_row], state, cfg)
+    stable_count = 0
+
+    for row in range(entry_row + 1, horizon_end_row + 1):
+        if is_locally_normalized(row, price_index, state, thresholds):
+            stable_count += 1
+        else:
+            stable_count = 0
+
+        if stable_count >= stable_needed:
+            return row, "local_normalization"
+
+    if horizon_end_row < episode_exit_row:
+        return horizon_end_row, "adaptive_trade_horizon"
+    return horizon_end_row, "episode_end"
+
+
+def estimate_episode_risk_budget(
+    event: pd.Series,
+    portfolio_size: int,
+    event_trade_horizon: float,
+    cfg: ResearchConfig,
+) -> float:
+    """
+    Estimate an ex-ante episode risk budget for headline return reporting.
+
+    Deployed-capital returns remain in the output, but the primary `return_pct`
+    uses max(actual capital deployed, this adaptive budget) as the denominator.
+    This prevents sparse deployment from mechanically inflating the headline
+    event return while preserving the full underlying sample.
+    """
+    duration = max(1.0, float(event["duration_days"]))
+    horizon = max(1.0, float(event_trade_horizon)) if np.isfinite(event_trade_horizon) else duration
+    severity = float(event["event_severity"]) if np.isfinite(event["event_severity"]) else 0.5
+    trigger_count = max(1.0, float(event.get("stitched_trigger_count", 1)))
+
+    cycle_scale = max(1.0, duration / horizon)
+    trigger_scale = max(1.0, np.sqrt(trigger_count))
+    activity_scale = max(cycle_scale, trigger_scale)
+    return float(cfg.investment_unit * portfolio_size * (0.5 + severity) * activity_scale)
+
+
+def simulate_strategy(
+    prices: pd.DataFrame,
+    returns: pd.DataFrame,
+    events: pd.DataFrame,
+    state: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    stock_vol: pd.DataFrame,
+    betas: pd.DataFrame,
+    drop_z_threshold: pd.Series,
+    trade_horizon: pd.Series,
+    lot_return_cap: pd.Series,
+    cfg: ResearchConfig,
+) -> pd.DataFrame:
+    """Simulate stock-selection uncertainty within each stitched episode."""
+    if events.empty:
+        return pd.DataFrame()
+
+    aligned_returns = returns.reindex(prices.index)
+    aligned_state = state.reindex(prices.index)
+    aligned_thresholds = thresholds.reindex(prices.index)
+    aligned_stock_vol = stock_vol.reindex(prices.index)
+    aligned_betas = betas.reindex(prices.index)
+    aligned_z_threshold = drop_z_threshold.reindex(prices.index)
+    aligned_trade_horizon = trade_horizon.reindex(prices.index).ffill().bfill()
+    aligned_lot_return_cap = lot_return_cap.reindex(prices.index).ffill()
+
+    prices_arr = prices.to_numpy(dtype=np.float64)
+    returns_arr = aligned_returns.to_numpy(dtype=np.float64)
+    stock_vol_arr = aligned_stock_vol.to_numpy(dtype=np.float64)
+    beta_arr = aligned_betas.to_numpy(dtype=np.float64)
+    z_threshold_arr = aligned_z_threshold.to_numpy(dtype=np.float64)
+    trade_horizon_arr = aligned_trade_horizon.to_numpy(dtype=np.float64)
+    lot_return_cap_arr = aligned_lot_return_cap.to_numpy(dtype=np.float64)
+    severity_arr = aligned_thresholds["event_severity"].to_numpy(dtype=np.float64)
+    market_arr = aligned_state["market_return"].to_numpy(dtype=np.float64)
+
+    tickers = np.array(prices.columns)
+    date_idx = {date: i for i, date in enumerate(prices.index)}
+    rng = np.random.default_rng(cfg.seed)
+    results: list[dict] = []
+
+    windows = build_event_windows(events, prices.index)
+    print(
+        "[simulation] Sampling stock portfolios within "
+        f"{len(windows):,} stitched episodes; {cfg.n_simulations:,} draws per episode."
+    )
+
+    for window in windows:
+        event = window["event"]
+        event_dates = window["dates"]
+        start = pd.Timestamp(event["event_date"])
+        end = pd.Timestamp(event["end_date"])
+        start_i = date_idx[start]
+        exit_i = date_idx[end]
+        event_row_idx = [date_idx[d] for d in event_dates]
+
+        betas_start = beta_arr[start_i]
+        prices_start = prices_arr[start_i]
+        systematic_component = betas_start * market_arr[start_i]
+        eligible_idx = np.flatnonzero(
+            np.isfinite(prices_start)
+            & (prices_start > 0)
+            & np.isfinite(betas_start)
+            & (betas_start > 0)
+            & (systematic_component < 0)
+        )
+
+        portfolio_size = adaptive_portfolio_size(len(eligible_idx), float(event["frac_down"]))
+        if portfolio_size == 0:
             continue
-        t0_idx = date_idx[t_start]
 
-        # Beta-based eligibility on the trigger day.
-        mkt_ret_t0           = mkt_arr_full[t0_idx]
-        betas_t0             = beta_arr[t0_idx]
-        prices_t0            = prices_arr[t0_idx]
-        systematic_component = betas_t0 * mkt_ret_t0
+        event_horizons = trade_horizon_arr[event_row_idx]
+        event_horizons = event_horizons[np.isfinite(event_horizons) & (event_horizons > 0)]
+        event_trade_horizon = float(np.median(event_horizons)) if len(event_horizons) else float(event["duration_days"])
+        episode_risk_budget = estimate_episode_risk_budget(event, portfolio_size, event_trade_horizon, cfg)
 
-        eligible = [
-            tickers[i]
-            for i in range(len(tickers))
-            if (not np.isnan(prices_t0[i])   and prices_t0[i] > 0
-                and not np.isnan(betas_t0[i]) and betas_t0[i] > 0
-                and systematic_component[i] < 0)
-        ]
+        for sim_id in range(cfg.n_simulations):
+            chosen_idx = rng.choice(eligible_idx, size=portfolio_size, replace=False)
+            chosen_tickers = tickers[chosen_idx]
 
-        if len(eligible) < portfolio_size:
-            continue
-
-        event_row_idx = [date_idx[d] for d in event_dates if d in date_idx]
-        if len(event_row_idx) < 2:
-            continue
-        exit_row = event_row_idx[-1]
-
-        for sim_id in range(n_simulations):
-            chosen     = rng.choice(eligible, size=portfolio_size, replace=False)
-            chosen_idx = [ticker_idx[t] for t in chosen]
-
-            shares      = np.zeros(portfolio_size)
-            invested    = np.zeros(portfolio_size)
-            # Track the lowest entry price for the new-low averaging rule.
+            invested = np.zeros(portfolio_size)
             lowest_purchase_price = np.full(portfolio_size, np.inf)
+            weighted_holding_days = 0.0
+            n_trade_days = 0
+            total_invested = 0.0
+            raw_gross_pnl = 0.0
+            gross_pnl = 0.0
+            transaction_cost = 0.0
+            lot_return_caps = 0
+            capped_pnl_reduction = 0.0
+            exit_counts = {
+                "local_normalization": 0,
+                "adaptive_trade_horizon": 0,
+                "episode_end": 0,
+            }
+            exit_cache: dict[int, tuple[int, str]] = {}
 
-            # CSS-adjusted investment on each qualifying day.
             for row in event_row_idx[1:-1]:
-                css = css_arr[row]
-                if np.isnan(css) or css <= 0:
-                    css = 1.0
-
-                z_scores   = np.zeros(portfolio_size)
-                valid_mask = np.zeros(portfolio_size, dtype=bool)
-
-                for k, col in enumerate(chosen_idx):
-                    ret_today   = returns_arr[row, col]
-                    price_today = prices_arr[row, col]
-                    std_today   = roll_std_arr[row, col]
-
-                    if (not np.isnan(ret_today)   and ret_today < 0
-                            and not np.isnan(price_today) and price_today > 0
-                            and not np.isnan(std_today)   and std_today > 0):
-
-                        # Add only below the previous lowest purchase price.
-                        if price_today >= lowest_purchase_price[k]:
-                            continue
-
-                        z_i = abs(ret_today) / std_today
-                        if z_i < z_min:
-                            continue
-                        z_scores[k]   = z_i
-                        valid_mask[k] = True
-
-                n_down = valid_mask.sum()
-                if n_down == 0:
+                z_min = z_threshold_arr[row]
+                if not np.isfinite(z_min):
                     continue
 
-                # CSS sets total capital; z-scores distribute capital across stocks.
-                z_valid = z_scores[valid_mask]
-                z_mean  = z_valid.mean()
-                z_norm  = z_valid / z_mean if z_mean > 0 else np.ones(n_down)
+                severity = severity_arr[row]
+                if not np.isfinite(severity) or severity <= 0:
+                    severity = float(event["event_severity"]) if np.isfinite(event["event_severity"]) else 0.5
 
+                z_scores = np.zeros(portfolio_size)
+                vol_scales = np.ones(portfolio_size)
+                valid_mask = np.zeros(portfolio_size, dtype=bool)
+                row_vols = stock_vol_arr[row, chosen_idx]
+                positive_vols = row_vols[np.isfinite(row_vols) & (row_vols > 0)]
+                median_vol = np.nanmedian(positive_vols) if len(positive_vols) else np.nan
+
+                for k, col in enumerate(chosen_idx):
+                    ret_today = returns_arr[row, col]
+                    price_today = prices_arr[row, col]
+                    sigma_today = stock_vol_arr[row, col]
+
+                    if (
+                        not np.isfinite(ret_today)
+                        or ret_today >= 0
+                        or not np.isfinite(price_today)
+                        or price_today <= 0
+                        or not np.isfinite(sigma_today)
+                        or sigma_today <= 0
+                    ):
+                        continue
+
+                    if price_today >= lowest_purchase_price[k]:
+                        continue
+
+                    z_i = abs(ret_today) / sigma_today
+                    if z_i < z_min:
+                        continue
+
+                    z_scores[k] = z_i
+                    if np.isfinite(median_vol) and median_vol > 0:
+                        vol_scales[k] = np.clip(median_vol / sigma_today, 0.25, 4.0)
+                    valid_mask[k] = True
+
+                if not valid_mask.any():
+                    continue
+
+                if row not in exit_cache:
+                    exit_cache[row] = find_lot_exit_row(
+                        entry_row=row,
+                        episode_exit_row=exit_i,
+                        price_index=prices.index,
+                        state=aligned_state,
+                        thresholds=aligned_thresholds,
+                        trade_horizon_arr=trade_horizon_arr,
+                        cfg=cfg,
+                    )
+                lot_exit_row, lot_exit_reason = exit_cache[row]
+
+                z_valid = z_scores[valid_mask]
+                z_norm = z_valid / np.nanmean(z_valid) if np.nanmean(z_valid) > 0 else np.ones_like(z_valid)
                 j = 0
                 for k, col in enumerate(chosen_idx):
                     if not valid_mask[k]:
                         continue
                     price_today = prices_arr[row, col]
-                    amount = investment_per_stock * css * z_norm[j]
-                    shares[k]   += amount / price_today
+                    amount = cfg.investment_unit * (0.5 + severity) * z_norm[j] * vol_scales[k]
+                    exit_price = prices_arr[lot_exit_row, col]
+                    if not np.isfinite(exit_price) or exit_price <= 0:
+                        prior_prices = prices_arr[: lot_exit_row + 1, col]
+                        prior_prices = prior_prices[np.isfinite(prior_prices) & (prior_prices > 0)]
+                        exit_price = prior_prices[-1] if len(prior_prices) else 0.0
+
+                    shares = amount / price_today
+                    raw_lot_return = (exit_price / price_today) - 1.0 if price_today > 0 else 0.0
+                    hold_days = max(1, lot_exit_row - row)
+                    daily_log_cap = lot_return_cap_arr[row] if row < len(lot_return_cap_arr) else np.nan
+                    lot_return = raw_lot_return
+
+                    if np.isfinite(daily_log_cap) and daily_log_cap > 0:
+                        scaled_cap = np.expm1(daily_log_cap * np.sqrt(hold_days))
+                        if np.isfinite(scaled_cap) and raw_lot_return > scaled_cap:
+                            lot_return = float(scaled_cap)
+                            lot_return_caps += 1
+                            capped_pnl_reduction += amount * (raw_lot_return - lot_return)
+
+                    raw_gross_pnl += amount * raw_lot_return
+                    gross_pnl += amount * lot_return
+                    transaction_cost += amount * cfg.round_trip_cost
+                    total_invested += amount
                     invested[k] += amount
-                    # Store the new price floor for this stock.
                     lowest_purchase_price[k] = price_today
+                    weighted_holding_days += amount * max(0, lot_exit_row - row)
+                    n_trade_days += 1
+                    exit_counts[lot_exit_reason] = exit_counts.get(lot_exit_reason, 0) + 1
                     j += 1
 
-            # Liquidate on the event exit day.
-            total_invested = invested.sum()
-            if total_invested == 0:
-                results.append({
-                    "event_date"       : t_start,
-                    "end_date"         : w["end_date"],
-                    "duration_days"    : duration,
-                    "market_return"    : w["market_return"],
-                    "apc"              : w["apc"],
-                    "sim_id"           : sim_id,
-                    "tickers"          : "|".join(chosen),
-                    "total_invested"   : 0.0,
-                    "total_pnl"        : 0.0,
-                    "return_pct"       : 0.0,
-                    "n_stocks_invested": 0,
-                    "avg_hold_days"    : float(duration),
-                })
+            base_row = {
+                "event_date": start,
+                "end_date": end,
+                "duration_days": int(event["duration_days"]),
+                "exit_reason": event["exit_reason"],
+                "stitched_trigger_count": int(event.get("stitched_trigger_count", 1)),
+                "market_return": float(event["market_return"]),
+                "worst_trigger_market_return": float(event.get("worst_trigger_market_return", event["market_return"])),
+                "apc": float(event["apc"]),
+                "peak_trigger_apc": float(event.get("peak_trigger_apc", event["apc"])),
+                "apc_threshold": float(event["apc_threshold"]),
+                "event_severity": float(event["event_severity"]),
+                "eligible_count": int(len(eligible_idx)),
+                "adaptive_portfolio_size": int(portfolio_size),
+                "adaptive_trade_horizon_days": float(event_trade_horizon),
+                "episode_risk_budget": float(episode_risk_budget),
+                "sim_id": sim_id,
+                "tickers": "|".join(chosen_tickers.astype(str)),
+            }
+
+            if total_invested <= 0:
+                results.append(
+                    {
+                        **base_row,
+                        "total_invested": 0.0,
+                        "raw_gross_pnl": 0.0,
+                        "gross_pnl": 0.0,
+                        "transaction_cost": 0.0,
+                        "net_pnl": 0.0,
+                        "capped_pnl_reduction": 0.0,
+                        "deployed_return_pct": 0.0,
+                        "return_on_budget_pct": 0.0,
+                        "return_pct": 0.0,
+                        "lot_return_caps": 0,
+                        "n_stocks_invested": 0,
+                        "n_trade_days": 0,
+                        "avg_hold_days": float(event["duration_days"]),
+                        "local_normalization_exits": 0,
+                        "adaptive_horizon_exits": 0,
+                        "episode_end_exits": 0,
+                    }
+                )
                 continue
 
-            total_pnl = 0.0
-            for k, col in enumerate(chosen_idx):
-                if shares[k] == 0:
-                    continue
-                exit_price = prices_arr[exit_row, col]
-                if np.isnan(exit_price) or exit_price <= 0:
-                    col_prices = prices_arr[:exit_row + 1, col]
-                    valid_p    = col_prices[~np.isnan(col_prices)]
-                    exit_price = valid_p[-1] if len(valid_p) else 0.0
-                total_pnl += shares[k] * exit_price - invested[k]
+            net_pnl = gross_pnl - transaction_cost
+            avg_hold = weighted_holding_days / total_invested if total_invested > 0 else np.nan
+            deployed_return_pct = net_pnl / total_invested * 100.0
+            budget_denominator = max(total_invested, episode_risk_budget)
+            return_on_budget_pct = net_pnl / budget_denominator * 100.0
+            results.append(
+                {
+                    **base_row,
+                    "total_invested": total_invested,
+                    "raw_gross_pnl": float(raw_gross_pnl),
+                    "gross_pnl": float(gross_pnl),
+                    "transaction_cost": float(transaction_cost),
+                    "net_pnl": float(net_pnl),
+                    "capped_pnl_reduction": float(capped_pnl_reduction),
+                    "deployed_return_pct": float(deployed_return_pct),
+                    "return_on_budget_pct": float(return_on_budget_pct),
+                    "return_pct": float(return_on_budget_pct),
+                    "lot_return_caps": int(lot_return_caps),
+                    "n_stocks_invested": int((invested > 0).sum()),
+                    "n_trade_days": int(n_trade_days),
+                    "avg_hold_days": float(avg_hold),
+                    "local_normalization_exits": int(exit_counts.get("local_normalization", 0)),
+                    "adaptive_horizon_exits": int(exit_counts.get("adaptive_trade_horizon", 0)),
+                    "episode_end_exits": int(exit_counts.get("episode_end", 0)),
+                }
+            )
 
-            results.append({
-                "event_date"       : t_start,
-                "end_date"         : w["end_date"],
-                "duration_days"    : duration,
-                "market_return"    : w["market_return"],
-                "apc"              : w["apc"],
-                "sim_id"           : sim_id,
-                "tickers"          : "|".join(chosen),
-                "total_invested"   : float(total_invested),
-                "total_pnl"        : float(total_pnl),
-                "return_pct"       : float(total_pnl / total_invested * 100),
-                "n_stocks_invested": int((invested > 0).sum()),
-                "avg_hold_days"    : float(duration),
-            })
+    result_df = pd.DataFrame(results)
+    print(f"[simulation] Generated {len(result_df):,} episode-simulation observations.")
+    return result_df
 
-    return pd.DataFrame(results)
-
-
-# Summary statistics
 
 def compute_summary(results: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate simulation results to the event level."""
+    """Collapse simulation draws to the independent episode level."""
     if results.empty:
         return pd.DataFrame()
 
-    agg = (results.groupby("event_date")
-           .agg(
-               market_return      = ("market_return",    "first"),
-               apc                = ("apc",               "first"),
-               end_date           = ("end_date",          "first"),
-               duration_days      = ("duration_days",     "first"),
-               mean_return_pct    = ("return_pct",        "mean"),
-               std_return_pct     = ("return_pct",        "std"),
-               win_rate           = ("return_pct",        lambda x: (x > 0).mean()),
-               median_return      = ("return_pct",        "median"),
-               mean_invested      = ("total_invested",    "mean"),
-               mean_hold_days     = ("avg_hold_days",     "mean"),
-               n_simulations      = ("sim_id",            "count"),
-           )
-           .reset_index())
+    summary = (
+        results.groupby("event_date", as_index=False)
+        .agg(
+            end_date=("end_date", "first"),
+            duration_days=("duration_days", "first"),
+            exit_reason=("exit_reason", "first"),
+            stitched_trigger_count=("stitched_trigger_count", "first"),
+            market_return=("market_return", "first"),
+            worst_trigger_market_return=("worst_trigger_market_return", "first"),
+            apc=("apc", "first"),
+            peak_trigger_apc=("peak_trigger_apc", "first"),
+            apc_threshold=("apc_threshold", "first"),
+            event_severity=("event_severity", "first"),
+            eligible_count=("eligible_count", "first"),
+            adaptive_portfolio_size=("adaptive_portfolio_size", "first"),
+            adaptive_trade_horizon_days=("adaptive_trade_horizon_days", "first"),
+            mean_episode_risk_budget=("episode_risk_budget", "mean"),
+            mean_return_pct=("return_pct", "mean"),
+            median_return_pct=("return_pct", "median"),
+            trimmed_mean_return_pct=("return_pct", lambda x: stats.trim_mean(x.dropna(), 0.10) if x.notna().sum() else np.nan),
+            p05_return_pct=("return_pct", lambda x: x.quantile(0.05)),
+            p95_return_pct=("return_pct", lambda x: x.quantile(0.95)),
+            std_return_pct=("return_pct", "std"),
+            mean_deployed_return_pct=("deployed_return_pct", "mean"),
+            median_deployed_return_pct=("deployed_return_pct", "median"),
+            mean_return_on_budget_pct=("return_on_budget_pct", "mean"),
+            win_rate=("return_pct", lambda x: (x > 0).mean()),
+            deployment_rate=("total_invested", lambda x: (x > 0).mean()),
+            mean_invested=("total_invested", "mean"),
+            mean_raw_gross_pnl=("raw_gross_pnl", "mean"),
+            mean_net_pnl=("net_pnl", "mean"),
+            mean_capped_pnl_reduction=("capped_pnl_reduction", "mean"),
+            mean_lot_return_caps=("lot_return_caps", "mean"),
+            total_lot_return_caps=("lot_return_caps", "sum"),
+            mean_transaction_cost=("transaction_cost", "mean"),
+            mean_hold_days=("avg_hold_days", "mean"),
+            local_normalization_exits=("local_normalization_exits", "sum"),
+            adaptive_horizon_exits=("adaptive_horizon_exits", "sum"),
+            episode_end_exits=("episode_end_exits", "sum"),
+            n_simulations=("sim_id", "count"),
+        )
+        .sort_values("event_date")
+    )
+    summary["headline_return_pct"] = summary["trimmed_mean_return_pct"]
+    summary["raw_mean_return_pct"] = summary["mean_return_pct"]
+    summary["event_sharpe"] = summary["mean_return_pct"] / summary["std_return_pct"].replace(0, np.nan)
+    return summary
 
-    agg["sharpe_ratio"] = agg["mean_return_pct"] / agg["std_return_pct"].replace(0, np.nan)
-    return agg.sort_values("event_date")
+
+def event_level_research_report(summary: pd.DataFrame, seed: int = 7) -> pd.DataFrame:
+    """Compute inference on stitched episodes, not on Monte Carlo rows."""
+    if summary.empty:
+        return pd.DataFrame(columns=["metric", "value"])
+
+    headline_col = "headline_return_pct" if "headline_return_pct" in summary.columns else "mean_return_pct"
+    investable = summary.loc[summary["deployment_rate"] > 0, headline_col].dropna()
+    raw_means = summary.loc[summary["deployment_rate"] > 0, "mean_return_pct"].dropna()
+    medians = summary.loc[summary["deployment_rate"] > 0, "median_return_pct"].dropna()
+    trimmed = summary.loc[summary["deployment_rate"] > 0, "trimmed_mean_return_pct"].dropna()
+    deployed = summary.loc[summary["deployment_rate"] > 0, "mean_deployed_return_pct"].dropna()
+    rng = np.random.default_rng(seed)
+
+    metrics: list[tuple[str, float | int | str]] = [
+        ("n_events", int(len(summary))),
+        ("n_investable_events", int(len(investable))),
+        ("first_event", str(pd.to_datetime(summary["event_date"].min()).date())),
+        ("last_event", str(pd.to_datetime(summary["event_date"].max()).date())),
+        ("mean_event_return_pct", float(investable.mean()) if len(investable) else np.nan),
+        ("median_event_return_pct", float(investable.median()) if len(investable) else np.nan),
+        ("mean_raw_event_return_pct", float(raw_means.mean()) if len(raw_means) else np.nan),
+        ("mean_deployed_event_return_pct", float(deployed.mean()) if len(deployed) else np.nan),
+        ("mean_event_median_return_pct", float(medians.mean()) if len(medians) else np.nan),
+        ("mean_event_trimmed_return_pct", float(trimmed.mean()) if len(trimmed) else np.nan),
+        ("mean_lot_return_caps", float(summary["mean_lot_return_caps"].mean()) if "mean_lot_return_caps" in summary.columns else np.nan),
+        ("total_lot_return_caps", int(summary["total_lot_return_caps"].sum()) if "total_lot_return_caps" in summary.columns else 0),
+        ("mean_capped_pnl_reduction", float(summary["mean_capped_pnl_reduction"].mean()) if "mean_capped_pnl_reduction" in summary.columns else np.nan),
+        ("event_hit_rate", float((investable > 0).mean()) if len(investable) else np.nan),
+        ("mean_deployment_rate", float(summary["deployment_rate"].mean())),
+        ("mean_duration_days", float(summary["duration_days"].mean())),
+        ("median_duration_days", float(summary["duration_days"].median())),
+        ("mean_stitched_trigger_count", float(summary["stitched_trigger_count"].mean())),
+        ("max_stitched_trigger_count", int(summary["stitched_trigger_count"].max())),
+    ]
+
+    if len(investable) >= 2:
+        t_stat, p_two_sided = stats.ttest_1samp(investable, 0.0, nan_policy="omit")
+        boot = np.array(
+            [
+                rng.choice(investable.to_numpy(), size=len(investable), replace=True).mean()
+                for _ in range(10000)
+            ]
+        )
+        metrics.extend(
+            [
+                ("event_level_t_stat", float(t_stat)),
+                ("event_level_one_sided_p_value", float(p_two_sided / 2.0)),
+                ("bootstrap_mean_ci_2p5", float(np.quantile(boot, 0.025))),
+                ("bootstrap_mean_ci_97p5", float(np.quantile(boot, 0.975))),
+                ("bootstrap_prob_mean_le_0", float(np.mean(boot <= 0.0))),
+            ]
+        )
+
+    return pd.DataFrame(metrics, columns=["metric", "value"])
 
 
-def print_report(summary: pd.DataFrame, results: pd.DataFrame) -> None:
-    """Print a compact research summary of the backtest results."""
-    if summary.empty or results.empty:
-        print("\n[report] No simulation results are available for reporting.")
+def print_report(summary: pd.DataFrame, report: pd.DataFrame) -> None:
+    """Print a compact empirical summary for the terminal."""
+    if summary.empty or report.empty:
+        print(
+            "[report] No empirical report is available because no investable "
+            "episodes were produced."
+        )
         return
 
-    sep = "-" * 64
-    print(f"\n{'='*64}")
-    print("  SYSTEMATIC EVENT MEAN-REVERSION: BACKTEST REPORT")
-    print(f"{'='*64}")
+    metric = dict(zip(report["metric"], report["value"]))
+    print("\n" + "=" * 72)
+    print("  ADAPTIVE APC EVENT-STUDY REPORT")
+    print("=" * 72)
+    print("Empirical sample")
+    print("-" * 72)
+    print(f"Stitched APC episodes              : {metric.get('n_events')}")
+    print(f"Investable episodes                : {metric.get('n_investable_events')}")
+    print(
+        f"Sample period                      : {metric.get('first_event')} "
+        f"to {metric.get('last_event')}"
+    )
+    print(
+        "Mean / median duration             : "
+        f"{float(metric.get('mean_duration_days', np.nan)):6.1f} / "
+        f"{float(metric.get('median_duration_days', np.nan)):6.1f} trading days"
+    )
+    print(
+        "Mean / max stitched triggers       : "
+        f"{float(metric.get('mean_stitched_trigger_count', np.nan)):6.1f} / "
+        f"{metric.get('max_stitched_trigger_count')}"
+    )
+    print("\nEpisode-level return estimates")
+    print("-" * 72)
+    print(
+        "Robust mean return                 : "
+        f"{float(metric.get('mean_event_return_pct', np.nan)):8.2f}%"
+    )
+    print(
+        "Robust median return               : "
+        f"{float(metric.get('median_event_return_pct', np.nan)):8.2f}%"
+    )
+    print(
+        "Raw mean risk-budget return        : "
+        f"{float(metric.get('mean_raw_event_return_pct', np.nan)):8.2f}%"
+    )
+    print(
+        "Mean deployed-capital return       : "
+        f"{float(metric.get('mean_deployed_event_return_pct', np.nan)):8.2f}%"
+    )
+    print(
+        "Mean of episode medians            : "
+        f"{float(metric.get('mean_event_median_return_pct', np.nan)):8.2f}%"
+    )
+    print(
+        "Mean trimmed episode return        : "
+        f"{float(metric.get('mean_event_trimmed_return_pct', np.nan)):8.2f}%"
+    )
+    print(f"Event hit rate                     : {float(metric.get('event_hit_rate', np.nan)):8.1%}")
+    print(f"Mean deployment rate               : {float(metric.get('mean_deployment_rate', np.nan)):8.1%}")
+    print(f"Lot payoff caps applied            : {metric.get('total_lot_return_caps')}")
 
-    print("\nEVENT SAMPLE")
-    print(sep)
-    print(f"  Total events detected           : {len(summary):>8}")
-    print(f"  Date range                      : "
-          f"{summary.event_date.min().date()} to {summary.event_date.max().date()}")
-    print(f"  Avg market return on event day  : "
-          f"{summary.market_return.mean():>8.2%}")
-    print(f"  Avg APC on event day            : "
-          f"{summary.apc.mean():>8.3f}")
-    print(f"  Avg event duration              : "
-          f"{summary.duration_days.mean():>8.1f} days")
-    print(f"  Median event duration           : "
-          f"{summary.duration_days.median():>8.1f} days")
+    if "event_level_t_stat" in metric:
+        print("\nInference on independent episodes")
+        print("-" * 72)
+        print(
+            "One-sample t-statistic             : "
+            f"{float(metric['event_level_t_stat']):8.3f}"
+        )
+        print(
+            "One-sided p-value                  : "
+            f"{float(metric['event_level_one_sided_p_value']):8.4f}"
+        )
+        print(
+            "Bootstrap mean 95% interval        : "
+            f"[{float(metric['bootstrap_mean_ci_2p5']):.2f}%, "
+            f"{float(metric['bootstrap_mean_ci_97p5']):.2f}%]"
+        )
 
-    print("\nCAPITAL DEPLOYMENT")
-    print(sep)
-    print(f"  Avg total invested per simulation : "
-          f"${results.total_invested.mean():>8.2f}")
-    print(f"  Median total invested per simulation: "
-          f"${results.total_invested.median():>8.2f}")
-    print(f"  Maximum total invested in one simulation: "
-          f"${results.total_invested.max():>8.2f}")
+    print("\nLargest robust-return episodes")
+    print("-" * 72)
+    ranking_col = (
+        "headline_return_pct"
+        if "headline_return_pct" in summary.columns
+        else "mean_return_pct"
+    )
+    cols = [
+        "event_date",
+        "end_date",
+        "duration_days",
+        "stitched_trigger_count",
+        ranking_col,
+        "mean_return_pct",
+        "win_rate",
+    ]
+    print(
+        summary.nlargest(5, ranking_col)[cols].to_string(
+            index=False,
+            float_format="{:.2f}".format,
+        )
+    )
 
-    print("\nRETURNS ACROSS ALL EVENTS AND SIMULATIONS")
-    print(sep)
-    all_rets = results["return_pct"]
-    # Exclude simulations in which no capital was deployed.
-    all_rets_nonzero = results.loc[results.total_invested > 0, "return_pct"]
-    print(f"  Mean return per portfolio       : {all_rets_nonzero.mean():>8.2f}%")
-    print(f"  Median return per portfolio     : {all_rets_nonzero.median():>8.2f}%")
-    print(f"  Std dev of returns              : {all_rets_nonzero.std():>8.2f}%")
-    print(f"  Overall win rate                : "
-          f"{(all_rets_nonzero > 0).mean():>8.1%}")
-    print(f"  Best portfolio return           : {all_rets_nonzero.max():>8.2f}%")
-    print(f"  Worst portfolio return          : {all_rets_nonzero.min():>8.2f}%")
-
-    # One-sample test of whether average return is above zero.
-    t_stat, p_val = stats.ttest_1samp(all_rets_nonzero.dropna(), 0)
-    print("\nSTATISTICAL INFERENCE")
-    print(sep)
-    print("  Null hypothesis: mean portfolio return = 0%")
-    print(f"  t-statistic                     : {t_stat:>8.3f}")
-    print(f"  p-value (one-sided)             : {p_val/2:>8.4f}")
-    sig = "reject at the 5% level" if p_val/2 < 0.05 else "do not reject at the 5% level"
-    print(f"  Result                          : {sig}")
-
-    print("\nHOLDING PERIOD")
-    print(sep)
-    print(f"  Mean event duration (days)      : "
-          f"{results.avg_hold_days.mean():>8.1f}")
-    print(f"  Median event duration (days)    : "
-          f"{results.avg_hold_days.median():>8.1f}")
-
-    print("\nTOP 5 EVENTS BY MEAN RETURN")
-    print(sep)
-    top5 = summary.nlargest(5, "mean_return_pct")[
-        ["event_date", "end_date", "duration_days",
-         "market_return", "mean_return_pct", "win_rate"]]
-    print(top5.to_string(index=False, float_format="{:.2f}".format))
-
-    print("\nBOTTOM 5 EVENTS BY MEAN RETURN")
-    print(sep)
-    bot5 = summary.nsmallest(5, "mean_return_pct")[
-        ["event_date", "end_date", "duration_days",
-         "market_return", "mean_return_pct", "win_rate"]]
-    print(bot5.to_string(index=False, float_format="{:.2f}".format))
-    print(f"\n{'='*64}\n")
-
-
-# Command-line interface
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Systematic Event Mean-Reversion Backtester")
-    p.add_argument("--file",           required=True,  help="Path to the price CSV file")
-    p.add_argument("--date-col",       default="date", help="Name of date column")
-    p.add_argument("--ticker-col",     default="ticker",help="Name of ticker column (long format)")
-    p.add_argument("--price-col",      default="price", help="Name of price column (long format)")
-    p.add_argument("--window",         type=int,   default=60,
-                   help="Rolling window for APC estimation (trading days, default 60)")
-    p.add_argument("--apc-threshold",  type=float, default=0.65,
-                   help="APC quantile used to define a correlation spike (default 0.65)")
-    p.add_argument("--cooldown",       type=int,   default=30,
-                   help="Minimum spacing between accepted events (default 30 days)")
-    p.add_argument("--portfolio-size", type=int,   default=10,
-                   help="Number of stocks sampled in each simulated portfolio (default 10)")
-    p.add_argument("--max-hold",       type=int,   default=756,
-                   help="Maximum holding period in trading days (default 756, approximately 3 years)")
-    p.add_argument("--apc-sample",     type=int,   default=50,
-                   help="Number of stocks subsampled for the APC estimate (default 50)")
-    p.add_argument("--n-simulations",  type=int,   default=200,
-                   help="Number of random portfolio draws per event (default 200)")
-    p.add_argument("--min-stocks",     type=int,   default=20,
-                   help="Minimum stocks with valid data required on an event day (default 20)")
-    p.add_argument("--min-history",    type=int,   default=252,
-                   help="Minimum past APC observations before event detection begins (default 252)")
-    p.add_argument("--mkt-drop-vol-window", type=int, default=60,
-                   help="Rolling window for the volatility-adjusted market drop filter (default 60)")
-    p.add_argument("--mkt-drop-vol-mult",   type=float, default=1.5,
-                   help="Standard-deviation multiplier for the market drop filter (default 1.5)")
-    p.add_argument("--investment",     type=float, default=1.0,
-                   help="Base dollars invested per qualifying stock-day (default $1)")
-    p.add_argument("--round-trip-cost", type=float, default=0.002,
-                   help="Round-trip transaction cost as fraction of trade value "
-                        "(default 0.002 = 0.2%%). Used in z_min calibration.")
-    p.add_argument("--out-prefix",     default="systematic_event_backtest",
-                   help="Prefix for output CSV files")
-    return p.parse_args()
+    print("\nSmallest robust-return episodes")
+    print("-" * 72)
+    print(
+        summary.nsmallest(5, ranking_col)[cols].to_string(
+            index=False,
+            float_format="{:.2f}".format,
+        )
+    )
+    print("=" * 72 + "\n")
 
 
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run an adaptive APC event study on a historical equity price panel"
+    )
+    parser.add_argument("--file", required=True, help="Path to the historical price CSV")
+    parser.add_argument(
+        "--date-col",
+        default="date",
+        help="Date column used to index observations",
+    )
+    parser.add_argument(
+        "--ticker-col",
+        default="ticker",
+        help="Ticker identifier for long-format data",
+    )
+    parser.add_argument(
+        "--price-col",
+        default="price",
+        help="Adjusted price column for long-format data",
+    )
+    parser.add_argument(
+        "--min-history",
+        type=int,
+        default=252,
+        help="Minimum prior observations required for adaptive empirical thresholds",
+    )
+    parser.add_argument(
+        "--apc-window-min",
+        type=int,
+        default=35,
+        help="Lower governance bound for the adaptive APC lookback",
+    )
+    parser.add_argument(
+        "--apc-window-max",
+        type=int,
+        default=126,
+        help="Upper governance bound for the adaptive APC lookback",
+    )
+    parser.add_argument(
+        "--max-apc-names",
+        type=int,
+        default=125,
+        help="Maximum deterministic cross-section used in APC estimation",
+    )
+    parser.add_argument(
+        "--n-simulations",
+        type=int,
+        default=500,
+        help="Monte Carlo stock-selection draws per stitched episode",
+    )
+    parser.add_argument(
+        "--investment",
+        type=float,
+        default=1.0,
+        help="Research capital unit before adaptive severity scaling",
+    )
+    parser.add_argument(
+        "--round-trip-cost",
+        type=float,
+        default=0.002,
+        help="Round-trip transaction cost as a fraction of invested capital",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+        help="Random seed for reproducible portfolio sampling",
+    )
+    parser.add_argument(
+        "--out-prefix",
+        default="adaptive_apc",
+        help="Prefix for generated research outputs",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
     args = parse_args()
+    cfg = ResearchConfig(
+        min_history=args.min_history,
+        apc_window_min=args.apc_window_min,
+        apc_window_max=args.apc_window_max,
+        max_apc_names=args.max_apc_names,
+        n_simulations=args.n_simulations,
+        investment_unit=args.investment,
+        round_trip_cost=args.round_trip_cost,
+        seed=args.seed,
+    )
 
-    # Load prices and construct daily returns.
-    prices  = load_prices(args.file, args.date_col,
-                          args.ticker_col, args.price_col)
+    prices = load_prices(args.file, args.date_col, args.ticker_col, args.price_col)
     returns = compute_returns(prices)
 
-    # Detect systematic events.
-    apc    = compute_rolling_apc(returns, window=args.window,
-                                 sample_size=args.apc_sample)
-    events, apc_expanding_thresh = identify_events(
-                             returns, apc,
-                             apc_threshold_quantile=args.apc_threshold,
-                             cooldown_days=args.cooldown,
-                             min_stocks_available=args.min_stocks,
-                             min_history_days=args.min_history,
-                             mkt_drop_vol_window=args.mkt_drop_vol_window,
-                             mkt_drop_vol_mult=args.mkt_drop_vol_mult,
-                             max_hold_days_scan=args.max_hold)
+    print("[research] Building the point-in-time market state.")
+    state = build_market_state(returns, cfg)
+    apc_frame = compute_adaptive_apc(returns, state, cfg)
+    thresholds = build_adaptive_thresholds(returns, state, apc_frame, cfg)
 
+    events = identify_events(returns, state, apc_frame, thresholds, cfg)
     if events.empty:
-        print("[main] No systematic events satisfied the selection criteria. "
-              "Consider lowering --apc-threshold or reviewing the market-drop filter.")
+        print("[research] No APC episodes satisfied the adaptive event-study filters.")
         return
 
-    # Run simulations.
-    print(f"\n[sim] Running {args.n_simulations:,} simulations for each of "
-          f"{len(events):,} detected events...")
-
-    # Rolling volatility is shared by calibration and simulation.
-    roll_std_df  = (returns.shift(1)
-                           .reindex(prices.index)
-                           .rolling(60, min_periods=20)
-                           .std())
-    roll_std_arr = roll_std_df.to_numpy(dtype=np.float64)
-
-    # Calibrate the z-score filter.
-    print("\n[calibrate] Selecting the z_min threshold from in-sample event observations...")
-    z_min = calibrate_z_threshold(
-        prices=prices, returns=returns, events=events,
-        apc=apc, apc_expanding_thresh=apc_expanding_thresh,
-        roll_std_arr=roll_std_arr,
-        round_trip_cost=args.round_trip_cost,
-    )
+    print("[research] Estimating adaptive volatility, beta, entry, horizon, and payoff-cap rules.")
+    stock_vol = estimate_adaptive_stock_volatility(returns, state, cfg)
+    betas = estimate_adaptive_betas(returns, state, cfg)
+    drop_z_threshold = build_drop_z_threshold(returns, stock_vol, state, cfg)
+    trade_horizon = build_adaptive_trade_horizon(events, state, prices.index, cfg)
+    lot_return_cap = build_adaptive_lot_return_cap(returns, state, cfg)
 
     results = simulate_strategy(
-        prices=prices, returns=returns, events=events,
-        apc=apc, apc_expanding_thresh=apc_expanding_thresh,
-        portfolio_size=args.portfolio_size,
-        max_hold_days=args.max_hold,
-        n_simulations=args.n_simulations,
-        investment_per_stock=args.investment,
-        z_min=z_min,
-        roll_std_arr=roll_std_arr,
+        prices=prices,
+        returns=returns,
+        events=events,
+        state=state,
+        thresholds=thresholds,
+        stock_vol=stock_vol,
+        betas=betas,
+        drop_z_threshold=drop_z_threshold,
+        trade_horizon=trade_horizon,
+        lot_return_cap=lot_return_cap,
+        cfg=cfg,
     )
-    print(f"[sim] Simulation complete. Total result rows: {len(results):,}.")
-
-    # Summarize and print the report.
     summary = compute_summary(results)
-    print_report(summary, results)
+    report = event_level_research_report(summary, seed=cfg.seed)
+    print_report(summary, report)
 
-    # Save CSV outputs.
-    out_results = f"{args.out_prefix}_results.csv"
-    out_summary = f"{args.out_prefix}_summary.csv"
-    results.to_csv(out_results, index=False)
-    summary.to_csv(out_summary, index=False)
-    print(f"[save] Wrote output files:\n  {out_results}\n  {out_summary}")
+    daily = pd.concat([state, apc_frame, thresholds, drop_z_threshold, trade_horizon, lot_return_cap], axis=1)
+    daily.index.name = "date"
+
+    out_prefix = Path(args.out_prefix)
+    results.to_csv(f"{out_prefix}_results.csv", index=False)
+    summary.to_csv(f"{out_prefix}_summary.csv", index=False)
+    events.to_csv(f"{out_prefix}_events.csv", index=False)
+    daily.reset_index().to_csv(f"{out_prefix}_daily_diagnostics.csv", index=False)
+    report.to_csv(f"{out_prefix}_research_report.csv", index=False)
+
+    print("[output] Research artifacts written:")
+    print(f"  {out_prefix}_results.csv")
+    print(f"  {out_prefix}_summary.csv")
+    print(f"  {out_prefix}_events.csv")
+    print(f"  {out_prefix}_daily_diagnostics.csv")
+    print(f"  {out_prefix}_research_report.csv")
 
 
 if __name__ == "__main__":
