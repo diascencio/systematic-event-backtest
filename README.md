@@ -229,3 +229,8 @@ The backtest outputs included here are generated from `all_stock_data.csv`.
 ## Disclaimer
 
 This project is for research and education only. It is not financial advice.
+
+## Author
+
+Diego Ascencio Schutz  
+GitHub: @diascencio(https://github.com/diascencio)
